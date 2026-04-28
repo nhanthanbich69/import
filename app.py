@@ -3,7 +3,7 @@ import pandas as pd
 from io import BytesIO
 
 st.set_page_config(page_title="Tạo File Import", layout="wide")
-st.title("📦 Tạo File Import (Chuẩn ERP)")
+st.title("📦 Tạo File Import (Python xử lý)")
 
 # ================= CORE =================
 def clean(df):
@@ -11,47 +11,69 @@ def clean(df):
     return df
 
 
-# ===== MAP ĐƠN VỊ (2 KEY như XLOOKUP) =====
+# ===== MAP ĐƠN VỊ =====
 def map_dvtinh(df, df_dv):
     if df_dv.empty:
-        return [""] * len(df)
+        return pd.Series([""] * len(df))
 
     df1 = df.copy()
     df2 = df_dv.copy()
 
     for col in ["Đơn vị lẻ", "Đơn vị lớn"]:
-        df1[col] = df1[col].astype(str).str.lower().str.strip()
-        df2[col] = df2[col].astype(str).str.lower().str.strip()
+        if col in df1.columns:
+            df1[col] = df1[col].astype(str).str.lower().str.strip()
+        if col in df2.columns:
+            df2[col] = df2[col].astype(str).str.lower().str.strip()
 
-    df_merge = df1.merge(
-        df2,
-        on=["Đơn vị lẻ", "Đơn vị lớn"],
-        how="left"
-    )
+    # merge 2 key
+    df_merge = df1.merge(df2, on=["Đơn vị lẻ", "Đơn vị lớn"], how="left")
 
-    return df_merge.get("Mã", "")
+    madv = df_merge["Mã"] if "Mã" in df_merge.columns else pd.Series([None]*len(df))
+
+    # fallback theo 1 key
+    mask = madv.isna()
+    if mask.any():
+        df_fb = df1[mask].merge(df2, on=["Đơn vị lẻ"], how="left")
+        if "Mã" in df_fb.columns:
+            madv.loc[mask] = df_fb["Mã"].values
+
+    return madv.fillna("")
 
 
 # ===== MAP VAT =====
-def map_vat(val):
-    if pd.isna(val):
-        return "0002"  # default 10%
+def map_vat_series(series):
+    def _map(v):
+        if pd.isna(v):
+            return "0002"
+        try:
+            x = float(str(v).replace("%", "").strip())
+        except:
+            return "0002"
 
-    val = str(val).replace("%", "").strip()
+        if x == 0:
+            return "0001"
+        elif x == 5:
+            return "0003"
+        elif x == 8:
+            return "0006"
+        else:
+            return "0002"
 
-    try:
-        v = float(val)
-    except:
-        return "0002"
+    return series.apply(_map)
 
-    if v == 0:
-        return "0001"
-    elif v == 5:
-        return "0003"
-    elif v == 8:
-        return "0006"
-    else:
-        return "0002"
+
+# ===== CLEAN NUMBER =====
+def to_number(df, cols):
+    for col in cols:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .replace("", "0")
+                .astype(float)
+            )
+    return df
 
 
 # ===== BUILD =====
@@ -59,29 +81,19 @@ def build(df, template_cols, df_dv):
     df = df.copy()
 
     # ===== CLEAN PRICE =====
-    price_cols = [
+    df = to_number(df, [
         "Giá bán có thuế",
         "Giá bán thùng có thuế",
         "Giá mua chưa thuế"
-    ]
-
-    for col in price_cols:
-        if col in df.columns:
-            df[col] = (
-                df[col].astype(str)
-                .str.replace(",", "")
-                .replace("", "0")
-                .astype(float)
-            )
+    ])
 
     VAT = 1.1
 
-    # ===== BUILD RESULT =====
-    result = pd.DataFrame(columns=template_cols)
+    result = pd.DataFrame(index=df.index)
 
     # ===== BASIC =====
     result["Mahangcuancc"] = df.get("Mã hàng NCC")
-    result["Masieuthi"] = ""  # để trống
+    result["Masieuthi"] = ""
 
     result["Madonvi"] = "0001"
     result["Manganh"] = df.get("Ngành hàng", "")
@@ -95,20 +107,26 @@ def build(df, template_cols, df_dv):
     result["Tendaydu"] = df.get("Tên sản phẩm", "")
     result["Tenviettat"] = result["Tendaydu"]
 
-    # ===== ĐƠN VỊ TÍNH =====
+    # ===== ĐƠN VỊ =====
     result["Madvtinh"] = map_dvtinh(df, df_dv)
 
     result["Makhachhang"] = ""
 
     # ===== VAT =====
-    vat_source = df.get("Mã VAT mua", df.get("VAT mua", 10))
-    result["Mavatmua"] = vat_source.apply(map_vat)
+    if "Mã VAT mua" in df.columns:
+        vat_series = df["Mã VAT mua"]
+    elif "VAT mua" in df.columns:
+        vat_series = df["VAT mua"]
+    else:
+        vat_series = pd.Series([10]*len(df))
+
+    result["Mavatmua"] = map_vat_series(vat_series)
     result["Mavatban"] = "0001"
 
     # ===== GIÁ =====
-    giaban_le = df.get("Giá bán có thuế", 0)
-    giaban_thung = df.get("Giá bán thùng có thuế", giaban_le)
-    giamua = df.get("Giá mua chưa thuế", 0)
+    giaban_le = df["Giá bán có thuế"] if "Giá bán có thuế" in df.columns else pd.Series([0]*len(df))
+    giaban_thung = df["Giá bán thùng có thuế"] if "Giá bán thùng có thuế" in df.columns else giaban_le
+    giamua = df["Giá mua chưa thuế"] if "Giá mua chưa thuế" in df.columns else pd.Series([0]*len(df))
 
     result["Giabanlecovat"] = giaban_le
     result["Giabanbuoncovat"] = giaban_thung
@@ -125,12 +143,16 @@ def build(df, template_cols, df_dv):
     result["Gialecodinh"] = giaban_le
     result["Giathungcodinh"] = giaban_thung
 
-    # ===== CÁC CỘT KHÁC =====
-    for col in template_cols:
-        if col not in result.columns:
-            result[col] = ""
+    # ===== FILL CỘT THEO TEMPLATE =====
+    final = pd.DataFrame(columns=template_cols)
 
-    return result
+    for col in template_cols:
+        if col in result.columns:
+            final[col] = result[col]
+        else:
+            final[col] = ""
+
+    return final
 
 
 def to_excel(df):
@@ -143,7 +165,6 @@ def to_excel(df):
 # ================= UI =================
 tab1, tab2 = st.tabs(["📥 Xử lý", "📊 Kết quả"])
 
-# ===== TAB 1 =====
 with tab1:
     file_source = st.file_uploader("📄 File danh mục NPP", type=["xlsx"])
     file_dv = st.file_uploader("📄 File đơn vị tính", type=["xlsx"])
@@ -170,7 +191,6 @@ with tab1:
                 st.error(e)
 
 
-# ===== TAB 2 =====
 with tab2:
     if "result" in st.session_state:
         df = st.session_state["result"]
